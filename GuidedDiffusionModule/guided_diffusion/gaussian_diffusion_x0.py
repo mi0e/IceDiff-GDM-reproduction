@@ -636,7 +636,6 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     scale=scale,
-                    scale=scale,
                     model_kwargs=model_kwargs,
                 )
                 yield out
