@@ -4,7 +4,7 @@ Given a low-resolution SIC map y (448x304, 25 km), sample a high-resolution map 
 from the unconditional prior. At every reverse step each overlapping 256x256 patch:
   1. predicts x0_hat with the prior,
   2. degrades it with its own optimizable 3x3 conv kernel D,
-  3. computes L = MSE(D(x0_hat), y_patch) and shifts the posterior mean by -s * dL/dx_t,
+  3. computes L = sum of squared errors between D(x0_hat) and y_patch, shifts the posterior mean by -s * dL/dx0_hat,
   4. updates D's kernel with dL/dkernel.
 Overlapping patch means/variances are averaged.
 
@@ -70,9 +70,9 @@ class GuidedPatchSampler:
             d = F.conv2d(to_unit(x0), k, padding=1, groups=3)
             if self.args.guidance_space == "lr":
                 d = F.avg_pool2d(d, s)
-            mse = ((d - y_patch) ** 2).mean()
-            gx, gk = th.autograd.grad(mse, [x0, k])
-        return gx, gk, mse.item()
+            se = ((d - y_patch) ** 2).sum()
+            gx, gk = th.autograd.grad(se, [x0, k])
+        return gx, gk, se.item() / d.numel()
 
     @th.no_grad()
     def sample(self, y_lr):
@@ -202,9 +202,9 @@ def create_argparser():
         patch_size=256,
         stride=128,
         guidance_space="hr",
-        guidance_scale=3800.0,
-        kernel_lr=0.01,
-        kernel_init="random",
+        guidance_scale=0.5,
+        kernel_lr=1e-8,
+        kernel_init="identity",
         start_t=0,
         apply_land_mask=True,
         save_png=True,

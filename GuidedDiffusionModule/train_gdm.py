@@ -129,7 +129,11 @@ def main():
         ema_path = os.path.join(args.log_dir, f"ema_{args.ema_rate}_{step:06d}.pt")
         ema_params = mp_trainer.state_dict_to_master_params(th.load(ema_path, map_location="cpu"))
         ema_params = [p.to(device) for p in ema_params]
-        opt.load_state_dict(th.load(os.path.join(args.log_dir, f"opt{step:06d}.pt"), map_location="cpu"))
+        opt_path = os.path.join(args.log_dir, f"opt{step:06d}.pt")
+        if os.path.exists(opt_path):
+            opt.load_state_dict(th.load(opt_path, map_location="cpu"))
+        else:
+            logger.log(f"{opt_path} missing, optimizer state starts fresh")
 
     ddp_model = DDP(model, device_ids=[local_rank] if th.cuda.is_available() else None,
                     find_unused_parameters=False) if world > 1 else model
@@ -165,6 +169,9 @@ def main():
     data = infinite(loader, sampler)
     t0 = time.time()
     while args.max_steps <= 0 or step < args.max_steps:
+        if args.deadline > 0 and time.time() >= args.deadline:
+            logger.log(f"deadline reached at step {step}")
+            break
         x, _ = next(data)
         x = x.to(device, non_blocking=True)
         mp_trainer.zero_grad()
@@ -225,6 +232,7 @@ def create_argparser():
         ema_rate=0.9999,
         fp16_scale_growth=1e-3,
         max_steps=0,
+        deadline=0,
         log_interval=100,
         save_interval=10000,
         val_batches=4,

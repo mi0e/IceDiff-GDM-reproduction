@@ -50,7 +50,7 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 | 训练步数 | 未定（`--max_steps 0` 表示不限） | 论文未给出 |
 | "resized and cropped" 的方式 | 先双三次 4× 放大再随机裁剪 | 推理时在 4× 尺寸上分 patch，训练分布需匹配该尺度 |
 | 裁剪位置过滤 | 海洋占比 ≥ 25%（`--min_ocean`，设 0 关闭） | 避免大量纯陆地样本 |
-| 引导 | `guidance_scale=3800`，`kernel_lr=0.01`，核随机初始化 /100 | 取自官方 `downscale.py` 默认值 |
+| 引导 | 平方误差**求和**，`guidance_scale=0.5`，核初始化为单位核，`kernel_lr=1e-8` | 官方取均值误差 + 3800 + 随机核 /100，实测几乎无引导（见下方"引导修正"） |
 | 引导空间 | 默认 `hr`（与官方代码一致）；可选 `lr`（卷积后平均池化，在 25 km 比较） | — |
 | Consistency 指标 | 输出 4×4 平均池化后与 LR 输入的 MSE（0–255 尺度） | GDP 定义"同退化后的 MSE"，未给公式 |
 | FID | 未实现 | 论文未说明 Inception 特征如何作用于 SIC 图 |
@@ -99,8 +99,33 @@ python sample_gdm.py --model_path runs/gdm/ema_0.9999_XXXXXX.pt \
 
 ROCm 版 PyTorch 通过 `torch.cuda` 接口暴露 AMD GPU，代码无需改动；`nccl` 后端在 ROCm 上即 RCCL。
 
+## 引导修正
+
+按官方 `downscale.py` 的写法（整个 patch 的**平均** MSE × 3800，卷积核 `rand/100`），每像素梯度约 1e-4，
+D(x) 只有 x 的约 4%，采样实际上是无条件生成。在训练 2000 步的模型上（测试集单日，25 步采样）对比：
+
+| s | 卷积核 | kernel_lr | Consistency |
+|---|---|---|---|
+| 官方设置 | 随机 /100 | 0.01 | ≈7800 |
+| 0.5 | 单位核 | 1e-5 | 4496 |
+| 2 | 单位核 | 1e-5 | 9274 |
+| 0.5 | 随机 /100 | 1e-5 | 9562 |
+| 0.5 | 单位核 | 1e-7 | 233 |
+| 0.5 | 单位核 | 0 | 119 |
+| **0.5** | **单位核** | **1e-8** | **107** |
+
+改为平方误差求和后核梯度大幅增大，`kernel_lr` 稍大就会让核漂移、引导失效；采用最后一行为默认值。
+每组仅 1 张图，结论供参考；论文 Table 2 的 6.84 与本实现的 Consistency 口径未必一致。
+
 ## 验证状态
 
+**AMD Radeon（gfx1100，48 GB，ROCm 7.2，PyTorch 2.9.1）实际训练**（2026-10-17）：
+- 配置：`num_channels=128`、`attention_resolutions=32,16,8`，约 1.38 亿参数（论文同款 256 通道约 5.5 亿，在该卡上
+  18 小时内无法充分训练）；batch 16，fp16，约 1.09 s/step
+- `--deadline` 到点自动保存并退出，随后 `run_all.sh` 对测试集抽样做 4× 降尺度
+- 第 2000 步验证 loss ≈ 0.0023；fp16 下 model/EMA/optimizer 断点加载已在服务器上用真实 checkpoint 验证
+
+**CPU 冒烟测试**：
 在 CPU（4 核）上用缩小模型（5.9M 参数）完成冒烟测试：
 - `prepare_sic.py`：全量数据处理完成，46 个文件 MD5 校验通过
 - `train_gdm.py`：loss 正常下降，checkpoint 保存、断点续训、验证 loss、预览图均正常
