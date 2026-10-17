@@ -28,7 +28,7 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 | 文件 | 作用 |
 |---|---|
 | `prepare_sic.py` | NSIDC G02202 V6 年度汇总文件 → `sic_{train,val,test}.npz` + `ocean_mask.npy` |
-| `sic_dataset.py` | 训练数据集：日图按倍数双三次放大后随机裁 256×256，复制为 3 通道，归一化到 [-1,1] |
+| `sic_dataset.py` | 训练数据集：在原始 25 km 日图上随机裁 256×256（`--upscale` 可选先放大），复制为 3 通道，归一化到 [-1,1] |
 | `train_gdm.py` | 无条件扩散先验训练（单卡 / `torchrun` 多卡，fp16，EMA，断点续训，验证 loss，预览图） |
 | `sample_gdm.py` | 论文 Algorithm 1 引导采样 + Fig. 3 patch 拼接，输出 4× 高分辨率 SIC 与 Consistency |
 
@@ -48,11 +48,11 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 | UNet 结构 | ch=256, res_blocks=2, attn=32,16,8, head_ch=64, resblock_updown, learn_sigma | OpenAI 256×256 无条件模型（guided-diffusion 原版配置，GDP 亦基于此） |
 | 学习率 / batch | 1e-4 / 8 每卡 | OpenAI 默认 |
 | 训练步数 | 未定（`--max_steps 0` 表示不限） | 论文未给出 |
-| "resized and cropped" 的方式 | 先双三次 4× 放大再随机裁剪 | 推理时在 4× 尺寸上分 patch，训练分布需匹配该尺度 |
+| "resized and cropped" 的方式 | 原始 25 km 图上随机裁 256×256（`--upscale 1`，默认） | 先验只在真实 25 km 数据上学海冰纹理，推理时 zero-shot 用到 6.25 km。早期版本默认先 4× 双三次放大再裁，模型只学到插值纹理（见"AMD 训练结果"），已弃用 |
 | 裁剪位置过滤 | 海洋占比 ≥ 25%（`--min_ocean`，设 0 关闭） | 避免大量纯陆地样本 |
 | 引导 | 平方误差**求和**，`guidance_scale=0.5`，核初始化为单位核，`kernel_lr=1e-8` | 官方取均值误差 + 3800 + 随机核 /100，实测几乎无引导（见下方"引导修正"） |
 | 引导空间 | 默认 `hr`（与官方代码一致）；可选 `lr`（卷积后平均池化，在 25 km 比较） | — |
-| Consistency 指标 | 输出 4×4 平均池化后与 LR 输入的 MSE（0–255 尺度） | GDP 定义"同退化后的 MSE"，未给公式 |
+| Consistency 指标 | 输出 4×4 平均池化后与 LR 输入的 MSE（0–255 尺度）；`sample_gdm.py` 打印的是全图均值（陆地误差为 0，会拉低数值） | **论文与 GDP 均未给公式，本口径为自定，与论文 Table 2 数值不可比**。该口径下最近邻插值得 0 分，只能作"不偏离输入"的合格线，不能衡量细节 |
 | FID | 未实现 | 论文未说明 Inception 特征如何作用于 SIC 图 |
 
 ## 数据处理（V4 → V6）
@@ -92,6 +92,7 @@ python train_gdm.py --train_npz ../data/gdm/sic_train.npz --val_npz ../data/gdm/
   --ocean_mask ../data/gdm/ocean_mask.npy --log_dir runs/gdm --batch_size 16
 
 # 5. 降尺度采样（测试集前 4 天）
+# 训练步数少时 EMA 未收敛，改用 runs/gdm/modelXXXXXX.pt
 python sample_gdm.py --model_path runs/gdm/ema_0.9999_XXXXXX.pt \
   --lr_npz ../data/gdm/sic_test.npz --ocean_mask ../data/gdm/ocean_mask.npy \
   --num_samples 4 --save_dir runs/gdm_samples
@@ -115,15 +116,30 @@ D(x) 只有 x 的约 4%，采样实际上是无条件生成。在训练 2000 步
 | **0.5** | **单位核** | **1e-8** | **107** |
 
 改为平方误差求和后核梯度大幅增大，`kernel_lr` 稍大就会让核漂移、引导失效；采用最后一行为默认值。
-每组仅 1 张图，结论供参考；论文 Table 2 的 6.84 与本实现的 Consistency 口径未必一致。
+每组仅 1 张图。注意：该扫参以 Consistency 最低为目标，而双三次/最近邻插值本身就是该口径下的最优解之一，
+所以这组参数偏向"贴近插值"，在原始尺度训练的模型上需重新评估。
 
 ## 验证状态
 
 **AMD Radeon（gfx1100，48 GB，ROCm 7.2，PyTorch 2.9.1）实际训练**（2026-10-17）：
 - 配置：`num_channels=128`、`attention_resolutions=32,16,8`，约 1.38 亿参数（论文同款 256 通道约 5.5 亿，在该卡上
-  18 小时内无法充分训练）；batch 16，fp16，约 1.09 s/step
-- `--deadline` 到点自动保存并退出，随后 `run_all.sh` 对测试集抽样做 4× 降尺度
-- 第 2000 步验证 loss ≈ 0.0023；fp16 下 model/EMA/optimizer 断点加载已在服务器上用真实 checkpoint 验证
+  18 小时内无法充分训练）；batch 16，fp16，约 1.09 s/step；**训练数据为 4× 双三次放大后裁剪（旧默认）**
+- 共 16788 步，验证 loss ≈ 0.0007；fp16 下 model/EMA/optimizer 断点加载已在服务器上用真实 checkpoint 验证
+- EMA 0.9999 在 1.7 万步时仍有约 19% 来自随机初始化，采样只产生噪声，改用原始权重；短训练建议 `--ema_rate 0.999`
+
+**AMD 训练结果：降尺度未产生真实细节**（测试集 4 天，25 步采样，仅统计海洋像素）：
+
+| 指标 | 扩散模型 | 双三次插值 | 最近邻 |
+|---|---|---|---|
+| Consistency（本文口径） | 42.3 | 42.3 | 0.0 |
+| 与双三次结果平均差异 | 0.30 / 255 | — | — |
+| 高频能量（4×4 块内残差均值） | 2.05 | 2.07 | 0.00 |
+| 中间密集度像素占比（10–90%） | 5.0% | 5.1% | — |
+
+输出与双三次插值几乎相同。原因：(1) 训练数据是双三次放大图，先验只学到插值纹理；(2) 引导以双三次放大的
+LR 为目标且参数按 Consistency 选取，把结果拉向插值；(3) 训练量远小于论文。下次训练应使用原始尺度（现默认）、
+`--guidance_space lr`，并以有真值的评测（25 km 降到 100 km 再 4× 放大，与 25 km 真值比 RMSE/SSIM，并对比双三次）
+代替单看 Consistency。
 
 **CPU 冒烟测试**：
 在 CPU（4 核）上用缩小模型（5.9M 参数）完成冒烟测试：
@@ -131,7 +147,7 @@ D(x) 只有 x 的约 4%，采样实际上是无条件生成。在训练 2000 步
 - `train_gdm.py`：loss 正常下降，checkpoint 保存、断点续训、验证 loss、预览图均正常
 - `sample_gdm.py`：4× 输出 1792×1216，`hr`/`lr` 两种引导空间与 `--start_t` 模式均可运行
 
-**尚未完成**：完整规模训练、GPU（ROCm）上的实际运行、与论文 Table 2 数值的对比。
+**尚未完成**：原始尺度下的训练、有真值的降尺度评测、FID。
 冒烟测试模型仅训练 15 步，Consistency 数值无意义。
 
 ## 未复现部分

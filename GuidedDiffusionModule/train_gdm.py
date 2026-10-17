@@ -224,7 +224,7 @@ def create_argparser():
         val_npz="/home/icediff/data/gdm/sic_val.npz",
         ocean_mask="/home/icediff/data/gdm/ocean_mask.npy",
         log_dir="runs/gdm",
-        upscale=4,
+        upscale=1,
         min_ocean=0.25,
         lr=1e-4,
         weight_decay=0.0,

@@ -5,13 +5,13 @@ from torch.utils.data import Dataset
 
 
 class SICCropDataset(Dataset):
-    """Random 256x256 crops from daily SIC maps, upsampled by `upscale` before cropping.
+    """Random 256x256 crops from daily SIC maps at native 25 km (optionally upsampled by `upscale` first).
 
     Returns (x, {}) with x in [-1, 1], shape [3, size, size] (SIC replicated to RGB, as the
     released UNet/sampler expect 3 channels).
     """
 
-    def __init__(self, npz_path, ocean_mask_path, size=256, upscale=4, min_ocean=0.25,
+    def __init__(self, npz_path, ocean_mask_path, size=256, upscale=1, min_ocean=0.25,
                  random_flip=True, samples_per_epoch=None):
         data = np.load(npz_path)
         self.sic = data["arr_0"]
