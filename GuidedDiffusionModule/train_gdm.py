@@ -57,9 +57,18 @@ def infinite(loader, sampler):
         epoch += 1
 
 
-def latest_checkpoint(log_dir):
-    ckpts = sorted(glob.glob(os.path.join(log_dir, "model[0-9]*.pt")))
-    return ckpts[-1] if ckpts else None
+def load_checkpoint(log_dir, ema_rate):
+    """Newest (step, model_sd, ema_sd, opt_path) whose files all load; skips partially written sets."""
+    for path in sorted(glob.glob(os.path.join(log_dir, "model[0-9]*.pt")), reverse=True):
+        step = step_of(path)
+        try:
+            model_sd = th.load(path, map_location="cpu")
+            ema_sd = th.load(os.path.join(log_dir, f"ema_{ema_rate}_{step:06d}.pt"), map_location="cpu")
+        except Exception as e:
+            logger.log(f"skipping unreadable checkpoint {path}: {e}")
+            continue
+        return step, model_sd, ema_sd, os.path.join(log_dir, f"opt{step:06d}.pt")
+    return None
 
 
 def step_of(path):
@@ -113,27 +122,26 @@ def main():
     )[1]
     logger.log(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
-    resume = latest_checkpoint(args.log_dir) if args.resume else None
+    ckpt = load_checkpoint(args.log_dir, args.ema_rate) if args.resume else None
     step = 0
-    if resume:
-        step = step_of(resume)
-        model.load_state_dict(th.load(resume, map_location="cpu"))
-        logger.log(f"resumed from {resume} at step {step}")
+    if ckpt:
+        step = ckpt[0]
+        model.load_state_dict(ckpt[1])
+        logger.log(f"resumed from step {step}")
 
     mp_trainer = MixedPrecisionTrainer(model=model, use_fp16=args.use_fp16,
                                        fp16_scale_growth=args.fp16_scale_growth)
     opt = th.optim.AdamW(mp_trainer.master_params, lr=args.lr, betas=(0.9, 0.999),
                          weight_decay=args.weight_decay)
     ema_params = copy.deepcopy(mp_trainer.master_params)
-    if resume:
-        ema_path = os.path.join(args.log_dir, f"ema_{args.ema_rate}_{step:06d}.pt")
-        ema_params = mp_trainer.state_dict_to_master_params(th.load(ema_path, map_location="cpu"))
+    if ckpt:
+        ema_params = mp_trainer.state_dict_to_master_params(ckpt[2])
         ema_params = [p.to(device) for p in ema_params]
-        opt_path = os.path.join(args.log_dir, f"opt{step:06d}.pt")
-        if os.path.exists(opt_path):
+        opt_path = ckpt[3]
+        try:
             opt.load_state_dict(th.load(opt_path, map_location="cpu"))
-        else:
-            logger.log(f"{opt_path} missing, optimizer state starts fresh")
+        except Exception as e:
+            logger.log(f"optimizer state not loaded ({e}), starts fresh")
 
     ddp_model = DDP(model, device_ids=[local_rank] if th.cuda.is_available() else None,
                     find_unused_parameters=False) if world > 1 else model
@@ -159,11 +167,17 @@ def main():
     def save():
         if rank != 0:
             return
-        th.save(mp_trainer.master_params_to_state_dict(mp_trainer.master_params),
-                os.path.join(args.log_dir, f"model{step:06d}.pt"))
-        th.save(mp_trainer.master_params_to_state_dict(ema_params),
-                os.path.join(args.log_dir, f"ema_{args.ema_rate}_{step:06d}.pt"))
-        th.save(opt.state_dict(), os.path.join(args.log_dir, f"opt{step:06d}.pt"))
+        d = args.log_dir
+        files = [
+            (mp_trainer.master_params_to_state_dict(ema_params), f"ema_{args.ema_rate}_{step:06d}.pt"),
+            (opt.state_dict(), f"opt{step:06d}.pt"),
+            (mp_trainer.master_params_to_state_dict(mp_trainer.master_params), f"model{step:06d}.pt"),
+        ]
+        for obj, name in files:
+            th.save(obj, os.path.join(d, name + ".tmp"))
+        # model is renamed last: its presence means the whole set is complete
+        for _, name in files:
+            os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
         logger.log(f"saved checkpoint at step {step}")
 
     data = infinite(loader, sampler)
