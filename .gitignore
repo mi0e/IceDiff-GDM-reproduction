@@ -4,3 +4,9 @@ runs/
 *.pt
 *.npz
 !Sample_SIC/*.nc
+data/
+models/
+eval_tune/
+eval_final/
+download/
+train.log

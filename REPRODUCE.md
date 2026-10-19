@@ -147,10 +147,16 @@ LR 为目标且参数按 Consistency 选取，把结果拉向插值；(3) 训练
 - `train_gdm.py`：loss 正常下降，checkpoint 保存、断点续训、验证 loss、预览图均正常
 - `sample_gdm.py`：4× 输出 1792×1216，`hr`/`lr` 两种引导空间与 `--start_t` 模式均可运行
 
-**尚未完成**：原始尺度下的训练、有真值的降尺度评测、FID。
+**PAI-DSW（AMD 约 206 GB 显存，仅 Jupyter）原始尺度训练**（2026-10-18 起，进行中）：
+- 入口 `boot.sh <剩余小时>`（取数据、自动续训，留 0.8 h 打包到 `download/`）→ `start_train.sh`
+- 配置：`--upscale 1`（原始 25 km）、128 通道、batch 32、lr 1e-4、EMA 0.9995、约 1.03 s/step；7.1 万步时 loss ≈ 0.0027
+- 打包时只保留最近 3 个 checkpoint，要对比的早期权重需另行复制
+
+**有真值的降尺度评测**：`run_eval.py` + `GuidedDiffusionModule/eval_gdm.py`、`eval_metrics.py`，
+用法见 `EVAL.md`，指标公式与出处（Consistency 来自 SR3/GDP、FID）见 `METRICS.md`。已在 CPU 上用随机权重跑通，尚无真实结果。
 冒烟测试模型仅训练 15 步，Consistency 数值无意义。
 
 ## 未复现部分
 - Stage-1 IceDiff-FM 未改动；`sample_gdm.py` 默认以真实 25 km 观测作为低分辨率输入，
   若要用 FM 预测结果作输入，将其保存为 `arr_0` [N,448,304]（uint8 0–255 或 float 0–1）即可。
-- 对比方法（DGP、GDP）与 FID 未实现。
+- 对比方法（DGP、GDP）未实现。
