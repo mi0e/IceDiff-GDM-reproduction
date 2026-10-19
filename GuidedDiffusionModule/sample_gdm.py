@@ -1,21 +1,28 @@
-"""IceDiff-GDM guided down-scaling (paper Algorithm 1 + patch strategy of Fig. 3).
+"""IceDiff-GDM guided down-scaling: paper Algorithm 1 with the patch strategy of Fig. 3.
 
-Given a low-resolution SIC map y (448x304, 25 km), sample a high-resolution map x (448s x 304s)
-from the unconditional prior. At every reverse step each overlapping 256x256 patch:
-  1. predicts x0_hat with the prior,
-  2. degrades it with its own optimizable 3x3 conv kernel D,
-  3. computes L = sum of squared errors between D(x0_hat) and y_patch, shifts the posterior mean by -s * dL/dx0_hat,
-  4. updates D's kernel with dL/dkernel.
-Overlapping patch means/variances are averaged.
+Given a 25 km SIC map y (448x304), sample a 6.25 km map x (1792x1216) from the unconditional prior.
+At every reverse step t, for each overlapping 256x256 patch (stride 128) with its own kernel k:
+  x0_hat = prediction of the prior
+  L      = || y_patch - D_k(x0_hat) ||^2,   D_k = 3x3 conv with k (normalised to sum 1), then s x s down-scaling
+  x0_hat <- x0_hat - g * dL/dx0_hat
+  mean, logvar = posterior q(x_{t-1} | x_t, x0_hat)
+  k      <- k - l * dL/dk
+Overlapping means / variances are averaged, then x_{t-1} is sampled.
 
-guidance_space=hr (released downscale.py): y is bicubic-upsampled, D runs at target resolution.
-guidance_space=lr: D is followed by s x s average pooling and compared with y at 25 km.
+--sampler ddim (with --timestep_respacing N) is a fast preview, not the paper setting: the posterior step
+is replaced by the DDIM step q_sigma(x_{t-1} | x_t, x0_hat) with sigma set by --eta.
 
-Input  --lr_npz: arr_0 uint8 [N,448,304] (prepare_sic.py output) or float SIC [N,448,304] in [0,1].
-Output samples.npz: hr uint8 [N,448s,304s], lr uint8 [N,448,304], dates (if present).
+Not given in the paper (values follow the released downscale.py): L is the mean squared error,
+g = 3800, k initialised to rand/100, l = 0.01. The down-scaling in D is s x s average pooling.
+The kernel is kept non-negative and normalised to sum 1 inside D (not in the released code): otherwise
+on uniform patches (all water / all pack ice) its scale is free and the guidance degenerates.
+
+Input  --lr_npz: arr_0 uint8 [N,448,304] (0..255) or float [N,448,304] in [0,1], optional `dates`.
+Output samples.npz: hr uint8 [N,448s,304s], lr uint8 [N,448,304], dates.
 """
 import argparse
 import os
+import time
 
 import numpy as np
 import torch as th
@@ -37,7 +44,7 @@ def grid_starts(length, patch, stride):
     return starts
 
 
-def load_lr(path, indices):
+def load_lr(path, every, limit):
     data = np.load(path)
     arr = data["arr_0"]
     if arr.ndim == 4:
@@ -45,142 +52,98 @@ def load_lr(path, indices):
     if arr.dtype != np.uint8:
         arr = np.round(np.clip(arr, 0, 1) * 255).astype(np.uint8)
     dates = data["dates"] if "dates" in data.files else np.arange(len(arr))
-    if indices is not None:
-        arr, dates = arr[indices], dates[indices]
-    return arr, dates
-
-
-def to_unit(x):
-    return (x + 1) / 2
+    idx = np.arange(0, len(arr), every)[:limit or None]
+    return arr[idx], dates[idx]
 
 
 class GuidedPatchSampler:
-    def __init__(self, model, diffusion, args, device):
-        self.model = model
-        self.diffusion = diffusion
-        self.args = args
-        self.device = device
-
-    def guidance(self, pred_xstart, y_patch, kernel):
-        """Return (grad wrt x0_hat, grad wrt kernel, mse) for one patch."""
-        s = self.args.scale
-        with th.enable_grad():
-            x0 = pred_xstart.detach().requires_grad_(True)
-            k = kernel.detach().requires_grad_(True)
-            d = F.conv2d(to_unit(x0), k, padding=1, groups=3)
-            if self.args.guidance_space == "lr":
-                d = F.avg_pool2d(d, s)
-            se = ((d - y_patch) ** 2).sum()
-            gx, gk = th.autograd.grad(se, [x0, k])
-        return gx, gk, se.item() / d.numel()
+    def __init__(self, model, diffusion, a, device):
+        self.model, self.diffusion, self.a, self.device = model, diffusion, a, device
 
     @th.no_grad()
-    def sample(self, y_lr):
-        """y_lr: [1, 3, H, W] in [0, 1]."""
-        a, s, p = self.args, self.args.scale, self.args.patch_size
-        H, W = y_lr.shape[2] * s, y_lr.shape[3] * s
-        y_hr = F.interpolate(y_lr, scale_factor=s, mode="bicubic", align_corners=False).clamp(0, 1)
+    def sample(self, y):
+        """y: [1, 3, h, w] in [0, 1]; returns [1, 3, h*s, w*s] in [-1, 1]."""
+        a, s, p, dev = self.a, self.a.scale, self.a.patch_size, self.device
+        H, W = y.shape[2] * s, y.shape[3] * s
         corners = [(h, w) for h in grid_starts(H, p, a.stride) for w in grid_starts(W, p, a.stride)]
+        y_patches = th.cat([y[:, :, h // s:(h + p) // s, w // s:(w + p) // s] for h, w in corners])
+        kernels = (th.rand(len(corners), 1, 1, 3, 3, device=dev) / 100).repeat(1, 3, 1, 1, 1)
 
-        kernels = {}
-        for c in corners:
-            k = th.rand(3, 1, 3, 3, device=self.device) / 100 if a.kernel_init == "random" \
-                else th.zeros(3, 1, 3, 3, device=self.device)
-            if a.kernel_init == "identity":
-                k[:, :, 1, 1] = 1.0
-            kernels[c] = k
-
-        T = self.diffusion.num_timesteps
-        if a.start_t > 0:
-            t0 = min(a.start_t, T) - 1
-            x = self.diffusion.q_sample(y_hr * 2 - 1, th.full((1,), t0, device=self.device, dtype=th.long))
-            steps = range(t0, -1, -1)
-        else:
-            x = th.randn(1, 3, H, W, device=self.device)
-            steps = range(T - 1, -1, -1)
-
-        for i in steps:
-            t = th.full((1,), i, device=self.device, dtype=th.long)
-            mean_acc = th.zeros_like(x)
-            logvar_acc = th.zeros_like(x)
-            count = th.zeros_like(x)
-            mses = []
-            for (h, w) in corners:
-                xp = x[:, :, h:h + p, w:w + p]
+        x = th.randn(1, 3, H, W, device=dev)
+        ddim = a.sampler == "ddim"
+        for i in range(self.diffusion.num_timesteps - 1, -1, -1):
+            if ddim:
+                ab, ab_prev = self.diffusion.alphas_cumprod[i], self.diffusion.alphas_cumprod_prev[i]
+                sigma = a.eta * np.sqrt((1 - ab_prev) / (1 - ab) * (1 - ab / ab_prev))
+            mean_acc, logvar_acc, count = th.zeros_like(x), th.zeros_like(x), th.zeros_like(x)
+            for c0 in range(0, len(corners), a.patch_batch):
+                cs = corners[c0:c0 + a.patch_batch]
+                n = len(cs)
+                xp = th.cat([x[:, :, h:h + p, w:w + p] for h, w in cs])
+                t = th.full((n,), i, device=dev, dtype=th.long)
                 out = self.diffusion.p_mean_variance(self.model, xp, t, clip_denoised=True)
-                if a.guidance_space == "lr":
-                    yp = y_lr[:, :, h // s:(h + p) // s, w // s:(w + p) // s]
+                with th.enable_grad():
+                    x0 = out["pred_xstart"].detach().float().requires_grad_(True)
+                    k = kernels[c0:c0 + n].detach().requires_grad_(True)
+                    kn = k / k.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+                    d = F.conv2d(((x0 + 1) / 2).reshape(1, 3 * n, p, p), kn.reshape(3 * n, 1, 3, 3),
+                                 padding=1, groups=3 * n).reshape(n, 3, p, p)
+                    d = F.avg_pool2d(d, s)
+                    loss = ((d - y_patches[c0:c0 + n]) ** 2).mean(dim=(1, 2, 3)).sum()
+                    gx, gk = th.autograd.grad(loss, [x0, k])
+                kernels[c0:c0 + n] = (k.detach() - a.kernel_lr * gk).clamp_min(0)
+                x0 = x0.detach() - a.guidance_scale * gx
+                if ddim:
+                    eps = self.diffusion._predict_eps_from_xstart(xp, t, x0)
+                    mean = np.sqrt(ab_prev) * x0 + np.sqrt(1 - ab_prev - sigma ** 2) * eps
+                    logvar = th.full_like(mean, 2 * np.log(max(sigma, 1e-20)))
                 else:
-                    yp = y_hr[:, :, h:h + p, w:w + p]
-                gx, gk, mse = self.guidance(out["pred_xstart"], yp, kernels[(h, w)])
-                kernels[(h, w)] = kernels[(h, w)] - a.kernel_lr * gk
-                mean = out["mean"] - a.guidance_scale * gx
-                mean_acc[:, :, h:h + p, w:w + p] += mean
-                logvar_acc[:, :, h:h + p, w:w + p] += out["log_variance"]
-                count[:, :, h:h + p, w:w + p] += 1
-                mses.append(mse)
-            mean = mean_acc / count
-            logvar = logvar_acc / count
+                    mean, _, logvar = self.diffusion.q_posterior_mean_variance(x0, xp, t)
+                for j, (h, w) in enumerate(cs):
+                    mean_acc[:, :, h:h + p, w:w + p] += mean[j:j + 1]
+                    logvar_acc[:, :, h:h + p, w:w + p] += logvar[j:j + 1]
+                    count[:, :, h:h + p, w:w + p] += 1
             noise = th.randn_like(x) if i > 0 else th.zeros_like(x)
-            x = mean + th.exp(0.5 * logvar) * noise
-            if a.verbose and i % 50 == 0:
-                print(f"t={i:4d}  guidance mse={np.mean(mses):.6f}")
+            x = mean_acc / count + th.exp(0.5 * logvar_acc / count) * noise
         return x.clamp(-1, 1)
 
 
-def consistency(hr_u8, lr_u8, scale):
-    """GDP-style consistency: MSE (0-255 scale) between avg-pooled output and LR input."""
-    hr = th.from_numpy(hr_u8.astype(np.float32))[:, None]
-    down = F.avg_pool2d(hr, scale)[:, 0].numpy()
-    return float(((down - lr_u8.astype(np.float32)) ** 2).mean())
-
-
 def main():
-    args = create_argparser().parse_args()
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
-    th.manual_seed(args.seed)
+    a = create_argparser().parse_args()
+    dev = th.device("cuda" if th.cuda.is_available() else "cpu")
+    a.use_fp16 = a.use_fp16 and dev.type == "cuda"
 
-    model, diffusion = create_model_and_diffusion(**args_to_dict(args, model_and_diffusion_defaults().keys()))
-    model.load_state_dict(th.load(args.model_path, map_location="cpu"))
-    model.to(device)
-    if args.use_fp16:
+    model, diffusion = create_model_and_diffusion(**args_to_dict(a, model_and_diffusion_defaults().keys()))
+    model.load_state_dict(th.load(a.model_path, map_location="cpu"))
+    model.to(dev)
+    if a.use_fp16:
         model.convert_to_fp16()
     model.eval()
 
-    idx = None
-    if args.indices:
-        idx = [int(i) for i in args.indices.split(",")]
-    elif args.num_samples > 0:
-        idx = list(range(args.num_samples))
-    lr_all, dates = load_lr(args.lr_npz, idx)
-    ocean = np.load(args.ocean_mask) if args.ocean_mask else None
-
-    os.makedirs(args.save_dir, exist_ok=True)
-    sampler = GuidedPatchSampler(model, diffusion, args, device)
-    hr_out, cons = [], []
+    lr_all, dates = load_lr(a.lr_npz, a.every, a.limit)
+    os.makedirs(a.save_dir, exist_ok=True)
+    sampler = GuidedPatchSampler(model, diffusion, a, dev)
+    hr_out = []
     for n, lr in enumerate(lr_all):
-        y = th.from_numpy(lr.astype(np.float32) / 255.0)[None, None].repeat(1, 3, 1, 1).to(device)
+        th.manual_seed(a.seed + n)
+        y = th.from_numpy(lr.astype(np.float32) / 255.0)[None, None].repeat(1, 3, 1, 1).to(dev)
+        t0 = time.time()
         x = sampler.sample(y)
         hr = ((x[0].mean(0) + 1) * 127.5).round().clamp(0, 255).to(th.uint8).cpu().numpy()
-        if ocean is not None and args.apply_land_mask:
-            land_hr = np.kron(~ocean, np.ones((args.scale, args.scale), dtype=bool))
-            hr[land_hr] = 0
         hr_out.append(hr)
-        cons.append(consistency(hr[None], lr[None], args.scale))
-        print(f"[{n + 1}/{len(lr_all)}] date={dates[n]} consistency={cons[-1]:.3f}")
-        if args.save_png:
-            Image.fromarray(hr).save(os.path.join(args.save_dir, f"{dates[n]}_hr.png"))
-            Image.fromarray(lr).save(os.path.join(args.save_dir, f"{dates[n]}_lr.png"))
-
-    np.savez(os.path.join(args.save_dir, "samples.npz"), hr=np.stack(hr_out), lr=lr_all, dates=dates)
-    print(f"mean consistency: {np.mean(cons):.3f}  -> {args.save_dir}/samples.npz")
+        print(f"[{n + 1}/{len(lr_all)}] date={dates[n]}  {time.time() - t0:.0f}s", flush=True)
+        if a.save_png:
+            Image.fromarray(hr).save(os.path.join(a.save_dir, f"{dates[n]}_hr.png"))
+            Image.fromarray(lr).save(os.path.join(a.save_dir, f"{dates[n]}_lr.png"))
+        np.savez(os.path.join(a.save_dir, "samples.npz"), hr=np.stack(hr_out), lr=lr_all[:n + 1], dates=dates[:n + 1])
+    print(f"-> {a.save_dir}/samples.npz")
 
 
 def create_argparser():
     defaults = model_and_diffusion_defaults()
     defaults.update(
         image_size=256,
-        num_channels=256,
+        num_channels=128,
         num_res_blocks=2,
         num_head_channels=64,
         attention_resolutions="32,16,8",
@@ -188,27 +151,24 @@ def create_argparser():
         use_scale_shift_norm=True,
         learn_sigma=True,
         noise_schedule="linear",
-        use_fp16=False,
+        use_fp16=True,
         timestep_respacing="",
     )
     defaults.update(
         model_path="",
-        lr_npz="/home/icediff/data/gdm/sic_test.npz",
-        ocean_mask="/home/icediff/data/gdm/ocean_mask.npy",
+        lr_npz="../data/sic_test.npz",
         save_dir="runs/gdm_samples",
-        num_samples=4,
-        indices="",
+        every=1,
+        limit=0,
         scale=4,
         patch_size=256,
         stride=128,
-        guidance_space="hr",
-        guidance_scale=0.5,
-        kernel_lr=1e-8,
-        kernel_init="identity",
-        start_t=0,
-        apply_land_mask=True,
+        patch_batch=16,
+        sampler="ddpm",
+        eta=0.0,
+        guidance_scale=3800.0,
+        kernel_lr=0.01,
         save_png=True,
-        verbose=True,
         seed=0,
     )
     parser = argparse.ArgumentParser()

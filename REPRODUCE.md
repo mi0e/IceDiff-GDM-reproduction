@@ -18,6 +18,7 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 | 推理代码逻辑缺陷 | `condition_mean` 未把 `scale` 传给 `cond_fn`（`1/None`）；`corner` 只有 3 个元素却访问 `corner[3]`；`light_mask` 固定 256×256 却按整图坐标索引 |
 | 数据集版本下架 | 论文用 NSIDC G02202 **V4**，已退役，现只能下载 **V6** |
 
+
 ## 修改内容
 
 ### 修复
@@ -28,32 +29,51 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 | 文件 | 作用 |
 |---|---|
 | `prepare_sic.py` | NSIDC G02202 V6 年度汇总文件 → `sic_{train,val,test}.npz` + `ocean_mask.npy` |
-| `sic_dataset.py` | 训练数据集：在原始 25 km 日图上随机裁 256×256（`--upscale` 可选先放大），复制为 3 通道，归一化到 [-1,1] |
-| `train_gdm.py` | 无条件扩散先验训练（单卡 / `torchrun` 多卡，fp16，EMA，断点续训，验证 loss，预览图） |
-| `sample_gdm.py` | 论文 Algorithm 1 引导采样 + Fig. 3 patch 拼接，输出 4× 高分辨率 SIC 与 Consistency |
+| `sic_dataset.py` | 训练数据集：在原始 25 km 日图上随机裁 256×256，复制为 3 通道，归一化到 [-1,1] |
+| `train_gdm.py` | 无条件扩散先验训练（单卡 / `torchrun` 多卡，fp16，EMA，断点续训，预览图） |
+| `sample_gdm.py` | 论文 Algorithm 1 引导采样 + Fig. 3 patch 策略，25 km → 6.25 km |
+| `eval_metrics.py` | Table 2 指标：Consistency、FID；对比最近邻 / 双线性 / 双三次 |
 
 ## 与论文对应关系
 
 **论文明确给出的设置（已照做）**
 - 数据划分：训练 1978-10-25 至 2013，验证 2014–2015，测试 2016–2023
-- 训练图像 256×256；AdamW β=(0.9, 0.999)；fp16 + loss scaling，fp32 主权重/EMA/优化器状态；EMA 0.9999
+- 训练图像 256×256；AdamW β=(0.9, 0.999)；fp16 + loss scaling，fp32 主权重/EMA/优化器状态
 - 1000 步扩散，采样与训练使用相同噪声表
-- patch 大小 256，stride 128；重叠区域均值平均；每个 patch 独立可优化卷积核
+- Algorithm 1：每步由先验估计 x̃₀，按 s·∇L 修正 x̃₀，再由修正后的 x̃₀ 计算后验均值和方差并采样 x_{t-1}，
+  同时以学习率 l 更新卷积核
+- patch 大小 256，stride 128；每个 patch 独立可优化卷积核；重叠区域平均
 - 目标：25 km（448×304）→ 6.25 km（1792×1216），即 4×
+- 评测指标：Consistency、FID；对比方法：最近邻、双线性、双三次、DGP、GDP
 
-**论文未给出、由本仓库假设的设置（需在报告中注明）**
+**论文未给出、由本仓库取定的设置（需在报告中注明）**
 
 | 项目 | 取值 | 依据 |
 |---|---|---|
-| UNet 结构 | ch=256, res_blocks=2, attn=32,16,8, head_ch=64, resblock_updown, learn_sigma | OpenAI 256×256 无条件模型（guided-diffusion 原版配置，GDP 亦基于此） |
-| 学习率 / batch | 1e-4 / 8 每卡 | OpenAI 默认 |
-| 训练步数 | 未定（`--max_steps 0` 表示不限） | 论文未给出 |
-| "resized and cropped" 的方式 | 原始 25 km 图上随机裁 256×256（`--upscale 1`，默认） | 先验只在真实 25 km 数据上学海冰纹理，推理时 zero-shot 用到 6.25 km。早期版本默认先 4× 双三次放大再裁，模型只学到插值纹理（见"AMD 训练结果"），已弃用 |
-| 裁剪位置过滤 | 海洋占比 ≥ 25%（`--min_ocean`，设 0 关闭） | 避免大量纯陆地样本 |
-| 引导 | 平方误差**求和**，`guidance_scale=0.5`，核初始化为单位核，`kernel_lr=1e-8` | 官方取均值误差 + 3800 + 随机核 /100，实测几乎无引导（见下方"引导修正"） |
-| 引导空间 | 默认 `hr`（与官方代码一致）；可选 `lr`（卷积后平均池化，在 25 km 比较） | — |
-| Consistency 指标 | 输出 4×4 平均池化后与 LR 输入的 MSE（0–255 尺度）；`sample_gdm.py` 打印的是全图均值（陆地误差为 0，会拉低数值） | **论文与 GDP 均未给公式，本口径为自定，与论文 Table 2 数值不可比**。该口径下最近邻插值得 0 分，只能作"不偏离输入"的合格线，不能衡量细节 |
-| FID | 未实现 | 论文未说明 Inception 特征如何作用于 SIC 图 |
+| UNet 结构 | ch=128, res_blocks=2, attn=32,16,8, head_ch=64, resblock_updown, learn_sigma（约 1.38 亿参数） | OpenAI 256×256 无条件模型结构，通道数受算力限制由 256 减为 128 |
+| 学习率 / batch | 1e-4 / 32 | OpenAI 默认学习率 |
+| 训练步数 | 83903 步 | 论文未给出，受机时限制 |
+| 距离函数 L | x̃₀ 退化后与 y 的均方误差 | 官方 `downscale.py` |
+| 引导系数 s | 3800 | 官方 `downscale.py` |
+| 卷积核初始化 / 学习率 l | `rand/100` / 0.01 | 官方 `downscale.py` |
+| 卷积核约束 | 前向中保持非负并归一化为和 1 | 官方未归一化；不归一化时在全水 / 全冰 patch 上核尺度不受约束，引导退化（见"DDIM 快速预览"） |
+| 退化函数 D 中的下采样 | 3×3 卷积后 4×4 平均池化，在 25 km 与 y 比较 | 论文称 D 为 down-scale function；块平均为 GDP 超分退化算子 |
+| Consistency | 输出 4×4 平均池化后与 25 km 输入的 MSE，0–255 尺度，全图 | GDP / SR3 定义；论文未给尺度，数值与 Table 2 不一定可比 |
+| FID | pytorch-fid（Inception-v3 pool3），输出切 256×256 patch（stride 128），参考集为 25 km 输入切 patch | 论文仅引用 Heusel et al. 2017；6.25 km 无真实参考图 |
+| 测试样本数 | 未定（`--every` / `--limit` 选取） | 论文未给出 |
+
+## 已知偏离
+
+| 项目 | 论文 / 官方 | 本仓库 | 原因 |
+|---|---|---|---|
+| 数据集版本 | G02202 V4 | G02202 V6 | V4 已下架 |
+| 缺测日期 | 未剔除，>100 的值置 0 | 剔除海洋缺测 >1% 的 112 天（集中在 1984、1986–1988，含 1987-12 至 1988-01 的 F8 卫星中断），其余 >100 的值置 0 | 避免整幅缺测图被当作"全无冰"；仅影响训练集，验证/测试集无剔除 |
+| 训练裁剪 | "resized and cropped to 256×256" | 原始 25 km 图上随机裁 256×256，要求海洋占比 ≥25% | 受机器限制的折中 |
+| EMA | 0.9999 | 0.9995 | 训练步数有限，0.9999 在短训练下未收敛 |
+| 模型规模 | 未给出 | 128 通道 | 算力限制 |
+| 引导的施加位置 | 论文 Algorithm 1 修正 x̃₀；官方代码直接把梯度加到后验均值 | 按论文 Algorithm 1 | 官方代码与论文不一致且无法运行，以论文为准 |
+| 卷积核 | 论文：每个 patch 独立；官方代码：所有 patch 共享并取平均 | 按论文，每个 patch 独立 | 同上 |
+| 降尺度输入 | IceDiff-FM 的 7 天 / 8 周平均 / 6 个月平均预报 | 暂用 25 km 观测 | FM 尚未训练（见"未复现部分"） |
 
 ## 数据处理（V4 → V6）
 
@@ -62,9 +82,7 @@ Diffusion Prior*（CVPR 2025，arXiv:2410.09111）中的 **Stage-2：IceDiff-GDM
 - 文件名 `seaice_conc_daily_nh_*_v04r00.nc` → `sic_psn25_*_v06r00.nc`，并提供按年汇总文件
 - V4 陆地/海岸/湖泊分别编码 254/253/252，V6 统一为 255；掩膜改用 `G02202-ancillary-psn25-v06r00.nc` 的
   `surface_type`（50 海洋 / 75 湖泊 / 200 海岸 / 250 陆地）
-- 预处理将 >100 的值置 0（与官方 FM 预处理一致）
-- **剔除海洋缺测 >1% 的日期**（共 112 天，集中在 1984、1986–1988，含 1987-12 至 1988-01 的 F8 卫星中断），
-  否则这些整幅缺测图会被当成"全无冰"污染训练
+- 预处理将 >100 的值置 0（与官方 FM 预处理一致）；剔除缺测日期见"已知偏离"
 
 处理结果：train 12740 天，val 730 天，test 2922 天，共约 2.1 GB。
 
@@ -79,84 +97,51 @@ curl -sL $U/aggregate/ | grep -oE 'sic_psn25_(19[0-9]{2}|20(0[0-9]|1[0-9]|2[0-3]
 curl -sfL -o ../G02202-ancillary-psn25-v06r00.nc https://noaadata.apps.nsidc.org/NOAA/G02202_V6/ancillary/G02202-ancillary-psn25-v06r00.nc
 cd -
 
-# 2. 依赖（AMD 上安装 ROCm 版 PyTorch：pip install torch --index-url https://download.pytorch.org/whl/rocm6.x）
-pip install numpy netCDF4 scipy opencv-python-headless pillow
+# 2. 依赖（AMD 上安装 ROCm 版 PyTorch；RTX 50 系需 cu128 版）
+pip install numpy netCDF4 scipy pillow pytorch-fid
 
 # 3. 生成 npz
 cd GuidedDiffusionModule
 python prepare_sic.py --raw_dir ../data/raw/aggregate \
-  --ancillary ../data/raw/G02202-ancillary-psn25-v06r00.nc --out_dir ../data/gdm
+  --ancillary ../data/raw/G02202-ancillary-psn25-v06r00.nc --out_dir ../data
 
-# 4. 训练（单卡；多卡用 torchrun --nproc_per_node=8）
-python train_gdm.py --train_npz ../data/gdm/sic_train.npz --val_npz ../data/gdm/sic_val.npz \
-  --ocean_mask ../data/gdm/ocean_mask.npy --log_dir runs/gdm --batch_size 16
+# 4. 训练（实际使用的配置见 start_train.sh）
+python train_gdm.py --train_npz ../data/sic_train.npz --val_npz ../data/sic_val.npz \
+  --ocean_mask ../data/ocean_mask.npy --log_dir runs/gdm --num_channels 128 --batch_size 32 --ema_rate 0.9995
 
-# 5. 降尺度采样（测试集前 4 天）
-# 训练步数少时 EMA 未收敛，改用 runs/gdm/modelXXXXXX.pt
-python sample_gdm.py --model_path runs/gdm/ema_0.9999_XXXXXX.pt \
-  --lr_npz ../data/gdm/sic_test.npz --ocean_mask ../data/gdm/ocean_mask.npy \
-  --num_samples 4 --save_dir runs/gdm_samples
+# 5. 降尺度采样（1000 步；--every/--limit 选取测试日期）
+python sample_gdm.py --model_path ../models/ema_083903.pt --lr_npz ../data/sic_test.npz \
+  --every 30 --save_dir runs/gdm_samples
+
+# 6. Table 2 指标
+python eval_metrics.py --samples runs/gdm_samples/samples.npz
 ```
 
 ROCm 版 PyTorch 通过 `torch.cuda` 接口暴露 AMD GPU，代码无需改动；`nccl` 后端在 ROCm 上即 RCCL。
 
-## 引导修正
+## DDIM 快速预览（非论文设置）
 
-按官方 `downscale.py` 的写法（整个 patch 的**平均** MSE × 3800，卷积核 `rand/100`），每像素梯度约 1e-4，
-D(x) 只有 x 的约 4%，采样实际上是无条件生成。在训练 2000 步的模型上（测试集单日，25 步采样）对比：
+1000 步 DDPM 在 RTX 5060 Ti 上约 80 分钟一张，为先看结果加了 `--sampler ddim --timestep_respacing N`：
+Algorithm 1 其余不变，只把"由 x̃₀ 和 x_t 计算后验并采样"换成 DDIM 步 q_σ(x_{t-1} | x_t, x̃₀)（`--eta 0` 为确定性）。
+50 步约 4 分钟一张。**预览结果不能作为 Table 2 复现结果。**
 
-| s | 卷积核 | kernel_lr | Consistency |
-|---|---|---|---|
-| 官方设置 | 随机 /100 | 0.01 | ≈7800 |
-| 0.5 | 单位核 | 1e-5 | 4496 |
-| 2 | 单位核 | 1e-5 | 9274 |
-| 0.5 | 随机 /100 | 1e-5 | 9562 |
-| 0.5 | 单位核 | 1e-7 | 233 |
-| 0.5 | 单位核 | 0 | 119 |
-| **0.5** | **单位核** | **1e-8** | **107** |
+官方取值（s=3800、核 `rand/100`、l=0.01）在 50 步下几乎没有引导：核从约 0.005 起步，D(x̃₀) 只有 x̃₀ 的几个百分点，
+Consistency 约 16000（双三次约 45）。只加大 s、l 也不行：在全水（y 全 0）的 patch 上，把核缩到 0 就能让误差为 0，
+引导失效，先验在开阔水域随机画出冰块；在全冰 patch 上核尺度与 x̃₀ 亮度互相补偿，出现灰色方块。
+因此核在 D 内保持非负并归一化为和 1（见上表"卷积核约束"）。
 
-改为平方误差求和后核梯度大幅增大，`kernel_lr` 稍大就会让核漂移、引导失效；采用最后一行为默认值。
-每组仅 1 张图。注意：该扫参以 Consistency 最低为目标，而双三次/最近邻插值本身就是该口径下的最优解之一，
-所以这组参数偏向"贴近插值"，在原始尺度训练的模型上需重新评估。
+s 论文未给出，在验证集（2014-01-01、2014-07-03 两张图的 128×152 裁块，含密集冰、冰缘和开阔水域）上按
+Consistency 选取，50 步 DDIM、核归一化后：
 
-## 验证状态
+| s | l | Consistency（冬 / 夏） |
+|---|---|---|
+| 2.5e5 | 0.01 | 33.6 / 26.4 |
+| 5e5 | 0.01 | 12.3 / 13.9 |
+| **1e6** | **0.01** | **6.0 / 12.2** |
+| 1e6 | 0 | 7.5 / 13.2 |
+| 1e6 | 0.1 | 61.5 / 41.3 |
+| 4e6 | 0.01 | 6.4 / 422.6 |
+| 1.6e7 | 0.01 | 2237 / 2625 |
+| 双三次 | — | 58.8 / 36.1 |
 
-**AMD Radeon（gfx1100，48 GB，ROCm 7.2，PyTorch 2.9.1）实际训练**（2026-10-17）：
-- 配置：`num_channels=128`、`attention_resolutions=32,16,8`，约 1.38 亿参数（论文同款 256 通道约 5.5 亿，在该卡上
-  18 小时内无法充分训练）；batch 16，fp16，约 1.09 s/step；**训练数据为 4× 双三次放大后裁剪（旧默认）**
-- 共 16788 步，验证 loss ≈ 0.0007；fp16 下 model/EMA/optimizer 断点加载已在服务器上用真实 checkpoint 验证
-- EMA 0.9999 在 1.7 万步时仍有约 19% 来自随机初始化，采样只产生噪声，改用原始权重；短训练建议 `--ema_rate 0.999`
-
-**AMD 训练结果：降尺度未产生真实细节**（测试集 4 天，25 步采样，仅统计海洋像素）：
-
-| 指标 | 扩散模型 | 双三次插值 | 最近邻 |
-|---|---|---|---|
-| Consistency（本文口径） | 42.3 | 42.3 | 0.0 |
-| 与双三次结果平均差异 | 0.30 / 255 | — | — |
-| 高频能量（4×4 块内残差均值） | 2.05 | 2.07 | 0.00 |
-| 中间密集度像素占比（10–90%） | 5.0% | 5.1% | — |
-
-输出与双三次插值几乎相同。原因：(1) 训练数据是双三次放大图，先验只学到插值纹理；(2) 引导以双三次放大的
-LR 为目标且参数按 Consistency 选取，把结果拉向插值；(3) 训练量远小于论文。下次训练应使用原始尺度（现默认）、
-`--guidance_space lr`，并以有真值的评测（25 km 降到 100 km 再 4× 放大，与 25 km 真值比 RMSE/SSIM，并对比双三次）
-代替单看 Consistency。
-
-**CPU 冒烟测试**：
-在 CPU（4 核）上用缩小模型（5.9M 参数）完成冒烟测试：
-- `prepare_sic.py`：全量数据处理完成，46 个文件 MD5 校验通过
-- `train_gdm.py`：loss 正常下降，checkpoint 保存、断点续训、验证 loss、预览图均正常
-- `sample_gdm.py`：4× 输出 1792×1216，`hr`/`lr` 两种引导空间与 `--start_t` 模式均可运行
-
-**PAI-DSW（AMD 约 206 GB 显存，仅 Jupyter）原始尺度训练**（2026-10-18 起，进行中）：
-- 入口 `boot.sh <剩余小时>`（取数据、自动续训，留 0.8 h 打包到 `download/`）→ `start_train.sh`
-- 配置：`--upscale 1`（原始 25 km）、128 通道、batch 32、lr 1e-4、EMA 0.9995、约 1.03 s/step；7.1 万步时 loss ≈ 0.0027
-- 打包时只保留最近 3 个 checkpoint，要对比的早期权重需另行复制
-
-**有真值的降尺度评测**：`run_eval.py` + `GuidedDiffusionModule/eval_gdm.py`、`eval_metrics.py`，
-用法见 `EVAL.md`，指标公式与出处（Consistency 来自 SR3/GDP、FID）见 `METRICS.md`。已在 CPU 上用随机权重跑通，尚无真实结果。
-冒烟测试模型仅训练 15 步，Consistency 数值无意义。
-
-## 未复现部分
-- Stage-1 IceDiff-FM 未改动；`sample_gdm.py` 默认以真实 25 km 观测作为低分辨率输入，
-  若要用 FM 预测结果作输入，将其保存为 `arr_0` [N,448,304]（uint8 0–255 或 float 0–1）即可。
-- 对比方法（DGP、GDP）未实现。
+预览取 **s=1e6、l=0.01**（l 与官方一致）。每组只用 1 个随机种子；1000 步 DDPM 正式运行时需在验证集上重新选取 s。
