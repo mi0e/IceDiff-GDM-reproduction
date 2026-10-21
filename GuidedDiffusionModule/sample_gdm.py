@@ -8,6 +8,8 @@ At every reverse step t, for each overlapping 256x256 patch (stride 128) with it
   mean, logvar = posterior q(x_{t-1} | x_t, x0_hat)
   k      <- k - l * dL/dk
 Overlapping means / variances are averaged, then x_{t-1} is sampled.
+--blend ramp (not the paper setting) weights each patch with a tent window instead of a plain average.
+--dates paper selects the appendix examples (PAPER_DATES); --dates YYYYMMDD,... any dates.
 
 --sampler ddim (with --timestep_respacing N) is a fast preview, not the paper setting: the posterior step
 is replaced by the DDIM step q_sigma(x_{t-1} | x_t, x0_hat) with sigma set by --eta.
@@ -18,7 +20,8 @@ The kernel is kept non-negative and normalised to sum 1 inside D (not in the rel
 on uniform patches (all water / all pack ice) its scale is free and the guidance degenerates.
 
 Input  --lr_npz: arr_0 uint8 [N,448,304] (0..255) or float [N,448,304] in [0,1], optional `dates`.
-Output samples.npz: hr uint8 [N,448s,304s], lr uint8 [N,448,304], dates.
+Output samples.npz: hr uint8 [N,448s,304s], lr uint8 [N,448,304], dates, final normalised kernels
+[N,K,3,3,3] (patch, channel) and patch corners [K,2] (6.25 km pixels).
 """
 import argparse
 import os
@@ -44,7 +47,10 @@ def grid_starts(length, patch, stride):
     return starts
 
 
-def load_lr(path, every, limit):
+PAPER_DATES = [20210708, 20210301, 20180415]  # the down-scaling examples shown in the paper appendix
+
+
+def load_lr(path, every, limit, dates_arg=""):
     data = np.load(path)
     arr = data["arr_0"]
     if arr.ndim == 4:
@@ -52,8 +58,24 @@ def load_lr(path, every, limit):
     if arr.dtype != np.uint8:
         arr = np.round(np.clip(arr, 0, 1) * 255).astype(np.uint8)
     dates = data["dates"] if "dates" in data.files else np.arange(len(arr))
-    idx = np.arange(0, len(arr), every)[:limit or None]
+    if dates_arg:
+        want = PAPER_DATES if dates_arg == "paper" else [int(d) for d in dates_arg.split(",")]
+        idx = np.array([int(np.where(dates == d)[0][0]) for d in want])
+    else:
+        idx = np.arange(0, len(arr), every)[:limit or None]
     return arr[idx], dates[idx]
+
+
+def blend_weight(p, mode, device):
+    """Per-pixel weight of a patch when overlapping patches are combined: 'mean' (paper) or 'ramp' (tent window)."""
+    if mode == "mean":
+        return th.ones(p, p, device=device)
+    r = th.minimum(th.arange(p, device=device), th.arange(p - 1, -1, -1, device=device)).float() + 1
+    return r[:, None] * r[None, :]
+
+
+def normalise(k):
+    return k / k.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
 
 class GuidedPatchSampler:
@@ -68,8 +90,10 @@ class GuidedPatchSampler:
         corners = [(h, w) for h in grid_starts(H, p, a.stride) for w in grid_starts(W, p, a.stride)]
         y_patches = th.cat([y[:, :, h // s:(h + p) // s, w // s:(w + p) // s] for h, w in corners])
         kernels = (th.rand(len(corners), 1, 1, 3, 3, device=dev) / 100).repeat(1, 3, 1, 1, 1)
+        self.corners, self.kernels_init = corners, normalise(kernels)
 
         x = th.randn(1, 3, H, W, device=dev)
+        wgt = blend_weight(p, a.blend, dev)
         ddim = a.sampler == "ddim"
         for i in range(self.diffusion.num_timesteps - 1, -1, -1):
             if ddim:
@@ -85,7 +109,7 @@ class GuidedPatchSampler:
                 with th.enable_grad():
                     x0 = out["pred_xstart"].detach().float().requires_grad_(True)
                     k = kernels[c0:c0 + n].detach().requires_grad_(True)
-                    kn = k / k.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+                    kn = normalise(k)
                     d = F.conv2d(((x0 + 1) / 2).reshape(1, 3 * n, p, p), kn.reshape(3 * n, 1, 3, 3),
                                  padding=1, groups=3 * n).reshape(n, 3, p, p)
                     d = F.avg_pool2d(d, s)
@@ -100,11 +124,12 @@ class GuidedPatchSampler:
                 else:
                     mean, _, logvar = self.diffusion.q_posterior_mean_variance(x0, xp, t)
                 for j, (h, w) in enumerate(cs):
-                    mean_acc[:, :, h:h + p, w:w + p] += mean[j:j + 1]
-                    logvar_acc[:, :, h:h + p, w:w + p] += logvar[j:j + 1]
-                    count[:, :, h:h + p, w:w + p] += 1
+                    mean_acc[:, :, h:h + p, w:w + p] += wgt * mean[j:j + 1]
+                    logvar_acc[:, :, h:h + p, w:w + p] += wgt * logvar[j:j + 1]
+                    count[:, :, h:h + p, w:w + p] += wgt
             noise = th.randn_like(x) if i > 0 else th.zeros_like(x)
             x = mean_acc / count + th.exp(0.5 * logvar_acc / count) * noise
+        self.kernels = normalise(kernels)
         return x.clamp(-1, 1)
 
 
@@ -120,10 +145,10 @@ def main():
         model.convert_to_fp16()
     model.eval()
 
-    lr_all, dates = load_lr(a.lr_npz, a.every, a.limit)
+    lr_all, dates = load_lr(a.lr_npz, a.every, a.limit, a.dates)
     os.makedirs(a.save_dir, exist_ok=True)
     sampler = GuidedPatchSampler(model, diffusion, a, dev)
-    hr_out = []
+    hr_out, kernels = [], []
     for n, lr in enumerate(lr_all):
         th.manual_seed(a.seed + n)
         y = th.from_numpy(lr.astype(np.float32) / 255.0)[None, None].repeat(1, 3, 1, 1).to(dev)
@@ -131,11 +156,13 @@ def main():
         x = sampler.sample(y)
         hr = ((x[0].mean(0) + 1) * 127.5).round().clamp(0, 255).to(th.uint8).cpu().numpy()
         hr_out.append(hr)
+        kernels.append(sampler.kernels[:, :, 0].cpu().numpy())
         print(f"[{n + 1}/{len(lr_all)}] date={dates[n]}  {time.time() - t0:.0f}s", flush=True)
         if a.save_png:
             Image.fromarray(hr).save(os.path.join(a.save_dir, f"{dates[n]}_hr.png"))
             Image.fromarray(lr).save(os.path.join(a.save_dir, f"{dates[n]}_lr.png"))
-        np.savez(os.path.join(a.save_dir, "samples.npz"), hr=np.stack(hr_out), lr=lr_all[:n + 1], dates=dates[:n + 1])
+        np.savez(os.path.join(a.save_dir, "samples.npz"), hr=np.stack(hr_out), lr=lr_all[:n + 1], dates=dates[:n + 1],
+                 kernels=np.stack(kernels), corners=np.array(sampler.corners))
     print(f"-> {a.save_dir}/samples.npz")
 
 
@@ -160,6 +187,8 @@ def create_argparser():
         save_dir="runs/gdm_samples",
         every=1,
         limit=0,
+        dates="",
+        blend="mean",
         scale=4,
         patch_size=256,
         stride=128,

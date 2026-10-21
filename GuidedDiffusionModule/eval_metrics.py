@@ -2,8 +2,9 @@
 nearest / bilinear / bicubic baselines (all 25 km -> 6.25 km).
 
 Not defined in the paper (choices here):
-  Consistency: MSE between the s x s average-pooled output and the 25 km input, SIC on the 0..255 scale
-               (GDP / SR3 definition).
+  Consistency: appendix definition (MSE between the 25 km map and the output passed through the convolution
+               function D); kernels for the baselines are not specified, the GDM's final per-patch kernels are
+               used for every method. SIC on the 0..255 scale.
   FID:         pytorch-fid Inception-v3 pool3 features of 256x256 patches (stride 128) of the outputs,
                against 256x256 patches of the 25 km input maps; SIC replicated to 3 channels.
 
@@ -29,9 +30,20 @@ def baselines(lr_u8, scale):
     return out
 
 
-def consistency(hr_u8, lr_u8, scale):
-    down = F.avg_pool2d(th.from_numpy(hr_u8.astype(np.float32))[:, None], scale)[:, 0].numpy()
-    return float(((down - lr_u8.astype(np.float32)) ** 2).mean())
+def consistency(hr_u8, lr_u8, scale, kernels, corners, patch=256):
+    """Paper appendix: MSE between the 25 km map and the down-scaled map passed through the convolution
+    function D. Each 6.25 km patch is convolved with that patch's final kernel from IceDiff-GDM sampling,
+    s x s average-pooled, and overlapping patches are averaged at 25 km. Same kernels for every method."""
+    errs = []
+    for x, y, k in zip(hr_u8.astype(np.float32), lr_u8.astype(np.float32), kernels):
+        acc, cnt = np.zeros_like(y), np.zeros_like(y)
+        xt = th.from_numpy(x)[None, None].repeat(1, 3, 1, 1)
+        for (h, w), kk in zip(corners, th.from_numpy(k).float()):
+            d = F.conv2d(xt[:, :, h:h + patch, w:w + patch], kk[:, None], padding=1, groups=3).mean(1, keepdim=True)
+            acc[h // scale:(h + patch) // scale, w // scale:(w + patch) // scale] += F.avg_pool2d(d, scale)[0, 0].numpy()
+            cnt[h // scale:(h + patch) // scale, w // scale:(w + patch) // scale] += 1
+        errs.append(((acc / cnt - y) ** 2).mean())
+    return float(np.mean(errs))
 
 
 def patches(maps, size=256, stride=128):
@@ -82,7 +94,7 @@ def main():
 
     rows = []
     for name, hr in methods.items():
-        rows.append((name, consistency(hr, lr, a.scale), frechet(*real, *fid.stats(patches(hr)))))
+        rows.append((name, consistency(hr, lr, a.scale, d["kernels"], d["corners"]), frechet(*real, *fid.stats(patches(hr)))))
         print(f"{name:12s} Consistency={rows[-1][1]:.3f}  FID={rows[-1][2]:.2f}")
 
     out = os.path.join(os.path.dirname(a.samples), "metrics.md")
